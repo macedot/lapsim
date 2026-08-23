@@ -6,34 +6,102 @@
     buildSmoothPath,
   } from './lib/raceline.js';
 
-  let svgMarkup = $state(null);
-  let fileName = $state('');
+  let circuits = $state([]); // { name, markup, text, racelineD, lineVisible, lengthM, widthM, racelineSvgLen, centerlineSvgLen, strokeWidthSvg }
+  let active = $state(-1);
   let error = $state('');
   let dragging = $state(false);
   let stage = $state(null);
   let fileInput;
-  let racelineD = $state(null);
   let computing = $state(false);
+  let progress = $state('');
 
   const RACELINE_ID = 'raceline-overlay';
 
-  async function loadFile(file) {
+  let current = $derived(active >= 0 ? circuits[active] : null);
+  let displayMarkup = $derived(
+    current && current.racelineD && current.lineVisible
+      ? current.markup.replace(
+          '</svg>',
+          `<path id="${RACELINE_ID}" d="${current.racelineD}" style="fill:none;stroke:#e33;stroke-width:2;stroke-linecap:round;stroke-linejoin:round"/></svg>`
+        )
+      : current?.markup
+  );
+
+  // meters per SVG unit, averaged over whichever dimensions the user gave
+  let scale = $derived.by(() => {
+    if (!current) return null;
+    let sum = 0;
+    let count = 0;
+    if (current.lengthM > 0 && current.centerlineSvgLen > 0) {
+      sum += current.lengthM / current.centerlineSvgLen;
+      count++;
+    }
+    if (current.widthM > 0 && current.strokeWidthSvg > 0) {
+      sum += current.widthM / current.strokeWidthSvg;
+      count++;
+    }
+    return count ? sum / count : null;
+  });
+
+  let racelineM = $derived(
+    scale != null && current?.racelineSvgLen ? current.racelineSvgLen * scale : null
+  );
+
+  async function loadFiles(files) {
     error = '';
-    if (!file) return;
-    if (!file.name.toLowerCase().endsWith('.svg') && file.type !== 'image/svg+xml') {
-      error = 'Please provide an SVG file.';
-      return;
+    let firstNew = -1;
+    let firstDupe = -1;
+    // snapshot: input.files is a live FileList — clearing the input (or the
+    // drag event ending) would empty it mid-loop across awaits
+    const list = [...(files ?? [])];
+    for (const file of list) {
+      if (!file.name.toLowerCase().endsWith('.svg') && file.type !== 'image/svg+xml') {
+        error = 'Some files were skipped: only SVG files are supported.';
+        continue;
+      }
+      const text = await file.text();
+      const dupeIdx = circuits.findIndex((c) => c.text === text);
+      if (dupeIdx >= 0) {
+        if (firstDupe < 0) firstDupe = dupeIdx;
+        error = `${file.name} is already loaded.`;
+        continue;
+      }
+      const doc = new DOMParser().parseFromString(text, 'image/svg+xml');
+      const svg = doc.querySelector('svg');
+      if (!svg || doc.querySelector('parsererror')) {
+        error = `Could not parse ${file.name} as SVG.`;
+        continue;
+      }
+      // ensure a viewBox so thumbnails can scale; these files are drawn on a
+      // fixed canvas given by the width/height attributes
+      if (!svg.getAttribute('viewBox')) {
+        const w = parseFloat(svg.getAttribute('width')) || 500;
+        const h = parseFloat(svg.getAttribute('height')) || 500;
+        svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+      }
+      svg.removeAttribute('width');
+      svg.removeAttribute('height');
+      if (firstNew < 0) firstNew = circuits.length;
+      circuits.push({
+        name: file.name,
+        markup: svg.outerHTML,
+        text,
+        racelineD: null,
+        lineVisible: false,
+        lengthM: parseFloat(svg.getAttribute('data-length-m')) || null,
+        widthM: parseFloat(svg.getAttribute('data-width-m')) || null,
+        racelineSvgLen: null,
+        centerlineSvgLen: null,
+        strokeWidthSvg: null,
+      });
     }
-    const text = await file.text();
-    const doc = new DOMParser().parseFromString(text, 'image/svg+xml');
-    const svg = doc.querySelector('svg');
-    if (!svg || doc.querySelector('parsererror')) {
-      error = 'Could not parse that file as SVG.';
-      return;
-    }
-    fileName = file.name;
-    racelineD = null;
-    svgMarkup = svg.outerHTML;
+    if (firstNew >= 0) await select(firstNew);
+    else if (firstDupe >= 0) await select(firstDupe);
+    await computeAllRacelines();
+  }
+
+  async function select(i) {
+    active = i;
     await tick();
     fitToContent();
   }
@@ -49,32 +117,41 @@
         `${bb.x - pad} ${bb.y - pad} ${bb.width + pad * 2} ${bb.height + pad * 2}`
       );
       svgEl.setAttribute('preserveAspectRatio', 'xMidYMid meet');
-      svgEl.removeAttribute('width');
-      svgEl.removeAttribute('height');
     } catch {
       // getBBox failed (e.g. empty svg) — leave as-is
     }
   }
 
   function onPick(e) {
-    loadFile(e.target.files?.[0]);
+    loadFiles(e.target.files);
     e.target.value = '';
   }
 
   function onDrop(e) {
     e.preventDefault();
     dragging = false;
-    loadFile(e.dataTransfer?.files?.[0]);
+    loadFiles(e.dataTransfer?.files);
   }
 
-  let displayMarkup = $derived(
-    svgMarkup && racelineD
-      ? svgMarkup.replace(
-          '</svg>',
-          `<path id="${RACELINE_ID}" d="${racelineD}" style="fill:none;stroke:#e33;stroke-width:2;stroke-linecap:round;stroke-linejoin:round"/></svg>`
-        )
-      : svgMarkup
-  );
+  function setDim(field, value) {
+    if (!current) return;
+    const v = parseFloat(value);
+    circuits[active] = { ...current, [field]: Number.isFinite(v) && v > 0 ? v : null };
+  }
+
+  async function removeCurrent() {
+    if (computing || !current) return;
+    circuits.splice(active, 1);
+    error = '';
+    if (!circuits.length) {
+      active = -1;
+      return;
+    }
+    // keep view on the track that shifted into this slot (or the last one)
+    active = Math.min(active, circuits.length - 1);
+    await tick();
+    fitToContent();
+  }
 
   function findTrackPath(svgEl) {
     let best = null;
@@ -95,11 +172,35 @@
     return best;
   }
 
+  const nextFrame = () =>
+    new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+  function computeRacelineFrom(trackPath) {
+    const { points, normals, halfWidth } = sampleCenterline(trackPath, 500);
+    const a = optimizeOffsets(points, normals, halfWidth);
+    const rp = points.map((pt, i) => [
+      pt[0] + a[i] * normals[i][0],
+      pt[1] + a[i] * normals[i][1],
+    ]);
+    let racelineSvgLen = 0;
+    for (let i = 0; i < rp.length; i++) {
+      const q = rp[(i + 1) % rp.length];
+      racelineSvgLen += Math.hypot(q[0] - rp[i][0], q[1] - rp[i][1]);
+    }
+    return {
+      racelineD: buildSmoothPath(points, normals, a),
+      racelineSvgLen,
+      centerlineSvgLen: trackPath.getTotalLength(),
+      strokeWidthSvg: halfWidth * 2,
+    };
+  }
+
   async function toggleRaceline() {
-    if (computing) return;
+    if (computing || !current) return;
     error = '';
-    if (racelineD) {
-      racelineD = null;
+    if (current.racelineD) {
+      // already computed once — just flip visibility, never recompute
+      circuits[active] = { ...current, lineVisible: !current.lineVisible };
       await tick();
       fitToContent();
       return;
@@ -112,11 +213,13 @@
     }
     computing = true;
     // let the button repaint before the (sub-second) computation blocks
-    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+    await nextFrame();
     try {
-      const { points, normals, halfWidth } = sampleCenterline(trackPath, 500);
-      const a = optimizeOffsets(points, normals, halfWidth);
-      racelineD = buildSmoothPath(points, normals, a);
+      circuits[active] = {
+        ...current,
+        lineVisible: true,
+        ...computeRacelineFrom(trackPath),
+      };
       await tick();
       fitToContent();
     } catch {
@@ -124,6 +227,48 @@
     } finally {
       computing = false;
     }
+  }
+
+  async function computeAllRacelines() {
+    if (computing) return;
+    const pending = circuits.map((c, i) => i).filter((i) => !circuits[i].racelineD);
+    if (!pending.length) return;
+    computing = true;
+    // geometry APIs need the SVG in the document — mount off-screen, never
+    // touching the visible stage
+    const holder = document.createElement('div');
+    holder.setAttribute('style', 'position:fixed;left:-10000px;top:0;');
+    document.body.appendChild(holder);
+    let failed = 0;
+    try {
+      for (let n = 0; n < pending.length; n++) {
+        progress = `${n + 1}/${pending.length}`;
+        // yield between tracks so the UI stays responsive
+        await nextFrame();
+        const i = pending[n];
+        try {
+          holder.innerHTML = circuits[i].markup;
+          const trackPath = findTrackPath(holder);
+          if (!trackPath) throw new Error('no track path');
+          circuits[i] = {
+            ...circuits[i],
+            lineVisible: true,
+            ...computeRacelineFrom(trackPath),
+          };
+        } catch {
+          failed++;
+        }
+      }
+    } finally {
+      holder.remove();
+      computing = false;
+      progress = '';
+    }
+    if (failed) {
+      error = `Could not compute the racing line for ${failed} file${failed > 1 ? 's' : ''}.`;
+    }
+    await tick();
+    fitToContent();
   }
 </script>
 
@@ -139,22 +284,70 @@
 />
 
 <main class:dragging>
-  {#if svgMarkup}
+  {#if current}
     <div class="stage" bind:this={stage}>
       {@html displayMarkup}
     </div>
-    <div class="bar">
-      <span class="name">{fileName}</span>
-      {#if error}<span class="error">{error}</span>{/if}
-      <button onclick={toggleRaceline} disabled={computing}>
-        {#if computing}Computing…{:else if racelineD}Hide line{:else}Ideal line{/if}
-      </button>
-      <button onclick={() => fileInput.click()}>Load another</button>
+    <button
+      class="raceline-btn"
+      onclick={toggleRaceline}
+      disabled={computing}
+    >
+      {#if computing}Computing{progress ? ' ' + progress : ''}…{:else if current.lineVisible}Hide line{:else if current.racelineD}Show line{:else}Ideal line{/if}
+    </button>
+    <div class="dims">
+      <label>
+        Length (m)
+        <input
+          type="number"
+          min="0"
+          step="any"
+          placeholder="—"
+          value={current.lengthM ?? ''}
+          onchange={(e) => setDim('lengthM', e.target.value)}
+        />
+      </label>
+      <label>
+        Width (m)
+        <input
+          type="number"
+          min="0"
+          step="any"
+          placeholder="—"
+          value={current.widthM ?? ''}
+          onchange={(e) => setDim('widthM', e.target.value)}
+        />
+      </label>
+      {#if racelineM != null}
+        <span class="readout">Raceline: {Math.round(racelineM).toLocaleString()} m</span>
+      {/if}
+    </div>
+    <div class="dock">
+      {#if circuits.length > 1}
+        <div class="thumbs">
+          {#each circuits as c, i}
+            <button
+              class="thumb"
+              class:selected={i === active}
+              title={c.name}
+              onclick={() => select(i)}
+            >
+              {@html c.markup}
+            </button>
+          {/each}
+        </div>
+      {/if}
+      <div class="bar">
+        <span class="name">{current.name}</span>
+        {#if error}<span class="error">{error}</span>{/if}
+        <button onclick={removeCurrent} disabled={computing}>Close</button>
+        <button onclick={() => fileInput.click()}>Add SVGs</button>
+      </div>
     </div>
   {:else}
     <button class="hint" onclick={() => fileInput.click()}>
       {#if error}<p class="error">{error}</p>{/if}
-      <p>Drop an SVG circuit here, or click to upload</p>
+      <p>Drop SVG circuits here, or click to upload</p>
     </button>
   {/if}
   <input
@@ -162,6 +355,7 @@
     type="file"
     accept=".svg,image/svg+xml"
     onchange={onPick}
+    multiple
     hidden
   />
 </main>
@@ -170,8 +364,12 @@
   main {
     height: 100vh;
     display: flex;
+    flex-direction: column;
     align-items: center;
     justify-content: center;
+    gap: 10px;
+    padding: 10px;
+    box-sizing: border-box;
     position: relative;
   }
 
@@ -181,14 +379,124 @@
   }
 
   .stage {
-    width: calc(100vw - 20px);
-    height: calc(100vh - 20px);
+    flex: 1;
+    min-height: 0;
+    width: 100%;
     display: flex;
     align-items: center;
     justify-content: center;
   }
 
   .stage :global(svg) {
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+
+  .raceline-btn {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    background: rgba(17, 17, 17, 0.7);
+    border: 1px solid #555;
+    color: #aaa;
+    border-radius: 4px;
+    padding: 4px 12px;
+    cursor: pointer;
+    font: inherit;
+    font-size: 0.85rem;
+  }
+
+  .raceline-btn:hover {
+    color: #eee;
+    border-color: #888;
+  }
+
+  .raceline-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
+  .dims {
+    position: absolute;
+    top: 48px;
+    right: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    background: rgba(17, 17, 17, 0.7);
+    border: 1px solid #555;
+    border-radius: 4px;
+    padding: 6px 10px;
+    font-size: 0.8rem;
+    color: #aaa;
+  }
+
+  .dims label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .dims input {
+    width: 72px;
+    background: none;
+    border: 1px solid #555;
+    border-radius: 4px;
+    color: #eee;
+    padding: 2px 6px;
+    font: inherit;
+  }
+
+  .dims input:focus {
+    outline: none;
+    border-color: #888;
+  }
+
+  .dims .readout {
+    color: #ccc;
+  }
+
+  .dock {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    align-items: center;
+    max-width: 100%;
+  }
+
+  .thumbs {
+    display: flex;
+    gap: 6px;
+    overflow-x: auto;
+    max-width: 100%;
+    padding: 4px;
+    background: rgba(17, 17, 17, 0.7);
+    border-radius: 6px;
+  }
+
+  .thumb {
+    flex: 0 0 auto;
+    width: 64px;
+    height: 64px;
+    padding: 2px;
+    background: none;
+    border: 1px solid #333;
+    border-radius: 4px;
+    cursor: pointer;
+    opacity: 0.6;
+  }
+
+  .thumb:hover {
+    opacity: 0.9;
+  }
+
+  .thumb.selected {
+    border-color: #999;
+    opacity: 1;
+  }
+
+  .thumb :global(svg) {
     width: 100%;
     height: 100%;
     display: block;
@@ -212,10 +520,6 @@
   }
 
   .bar {
-    position: absolute;
-    bottom: 10px;
-    left: 50%;
-    transform: translateX(-50%);
     display: flex;
     gap: 0.75rem;
     align-items: center;
